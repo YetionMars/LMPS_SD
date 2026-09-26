@@ -16,6 +16,7 @@
 
 #include "atom.h"
 #include "comm.h"
+#include "domain.h"
 #include "error.h"
 #include "force.h"
 #include "graphics.h"
@@ -33,6 +34,10 @@
 
 using namespace LAMMPS_NS;
 using namespace FixConst;
+
+// bond/break/c v1.1:
+// tensile failure permanently deletes topology as in fix bond/break;
+// compression failure negates the bond type and preserves all topology.
 
 static constexpr int DELTA = 16;
 
@@ -195,6 +200,7 @@ void FixBondBreakC::init()
 void FixBondBreakC::post_integrate()
 {
   int i,j,k,m,n,i1,i2,n1,n3,type;
+  int ndelete,deletecount;
   double delx,dely,delz,rsq,candidate_score;
   tagint candidate_partner;
   tagint *slist;
@@ -320,6 +326,7 @@ void FixBondBreakC::post_integrate()
   tagint **special = atom->special;
 
   nbreak = 0;
+  ndelete = 0;
   for (i = 0; i < nlocal; i++) {
     if (partner[i] == 0) continue;
     j = atom->map(partner[i]);
@@ -335,43 +342,76 @@ void FixBondBreakC::post_integrate()
       }
     }
 
-    // delete bond from atom I if I stores it
-    // atom J will also do this
+    // Recompute the selected bond length before changing its topology.
+    // Candidate selection and bond modification occur in the same call, so
+    // no integration step has changed the coordinates in between.
 
-    for (m = 0; m < num_bond[i]; m++) {
-      if (bond_atom[i][m] == partner[i]) {
-        for (k = m; k < num_bond[i]-1; k++) {
-          bond_atom[i][k] = bond_atom[i][k+1];
-          bond_type[i][k] = bond_type[i][k+1];
+    delx = x[i][0] - x[j][0];
+    dely = x[i][1] - x[j][1];
+    delz = x[i][2] - x[j][2];
+    domain->minimum_image(FLERR,delx,dely,delz);
+    rsq = delx*delx + dely*dely + delz*delz;
+
+    const bool compression_failure = (rsq < mincutsq);
+
+    if (compression_failure) {
+
+      // Compression failure: retain the bond topology but negate its type.
+      // LAMMPS excludes negative bond types from bond force/energy lists.
+      // Keeping the topology also preserves angles, dihedrals, impropers,
+      // and the existing 1-2/1-3/1-4 special-neighbor relationships.
+
+      for (m = 0; m < num_bond[i]; m++) {
+        if (bond_atom[i][m] == partner[i] && bond_type[i][m] == btype) {
+          bond_type[i][m] = -bond_type[i][m];
+          break;
+        }
+      }
+
+    } else {
+
+      // Tensile failure: retain the original fix bond/break behavior and
+      // permanently remove the selected bond from atom I if I stores it.
+
+      for (m = 0; m < num_bond[i]; m++) {
+        if (bond_atom[i][m] == partner[i]) {
+          for (k = m; k < num_bond[i]-1; k++) {
+            bond_atom[i][k] = bond_atom[i][k+1];
+            bond_type[i][k] = bond_type[i][k+1];
+            if (n_histories > 0)
+              for (auto &ihistory: histories)
+                dynamic_cast<FixBondHistory *>(ihistory)->shift_history(i,k,k+1);
+          }
           if (n_histories > 0)
             for (auto &ihistory: histories)
-              dynamic_cast<FixBondHistory *>(ihistory)->shift_history(i,k,k+1);
+              dynamic_cast<FixBondHistory *>(ihistory)->delete_history(i,num_bond[i]-1);
+          num_bond[i]--;
+          break;
         }
-        if (n_histories > 0)
-          for (auto &ihistory: histories)
-            dynamic_cast<FixBondHistory *>(ihistory)->delete_history(i,num_bond[i]-1);
-        num_bond[i]--;
-        break;
       }
+
+      // Remove J from the special list only for a permanently deleted bond.
+
+      slist = special[i];
+      n1 = nspecial[i][0];
+      for (m = 0; m < n1; m++)
+        if (slist[m] == partner[i]) break;
+      n3 = nspecial[i][2];
+      for (; m < n3-1; m++) slist[m] = slist[m+1];
+      nspecial[i][0]--;
+      nspecial[i][1]--;
+      nspecial[i][2]--;
+
+      // Only tensile deletion is forwarded to update_topology(), where
+      // affected angles, dihedrals, and impropers are removed.
+
+      finalpartner[i] = tag[j];
+      finalpartner[j] = tag[i];
+      if (tag[i] < tag[j]) ndelete++;
     }
 
-    // remove J from special bond list for atom I
-    // atom J will also do this, whatever proc it is on
+    // Count both tensile deletion and compression deactivation as one event.
 
-    slist = special[i];
-    n1 = nspecial[i][0];
-    for (m = 0; m < n1; m++)
-      if (slist[m] == partner[i]) break;
-    n3 = nspecial[i][2];
-    for (; m < n3-1; m++) slist[m] = slist[m+1];
-    nspecial[i][0]--;
-    nspecial[i][1]--;
-    nspecial[i][2]--;
-
-    // store final broken bond partners and count the broken bond once
-
-    finalpartner[i] = tag[j];
-    finalpartner[j] = tag[i];
     if (tag[i] < tag[j]) nbreak++;
 
     // record atoms involved in broken bond
@@ -384,8 +424,9 @@ void FixBondBreakC::post_integrate()
   // tally stats
 
   MPI_Allreduce(&nbreak,&breakcount,1,MPI_INT,MPI_SUM,world);
+  MPI_Allreduce(&ndelete,&deletecount,1,MPI_INT,MPI_SUM,world);
   breakcounttotal += breakcount;
-  atom->nbonds -= breakcount;
+  atom->nbonds -= deletecount;
 
   // trigger reneighboring if any bonds were broken
   // this ensures neigh lists will immediately reflect the topology changes
