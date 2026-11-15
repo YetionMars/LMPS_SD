@@ -19,11 +19,15 @@
 
 #include "atom.h"
 #include "comm.h"
+#include "dihedral_degradation.h"
 #include "error.h"
+#include "fix.h"
 #include "force.h"
 #include "memory.h"
+#include "modify.h"
 #include "neighbor.h"
 
+#include <algorithm>
 #include <cmath>
 
 using namespace LAMMPS_NS;
@@ -68,8 +72,17 @@ void DihedralHarmonic::compute(int eflag, int vflag)
   edihedral = 0.0;
   ev_init(eflag, vflag);
 
+  std::vector<const DihedralDegradation *> degradation_sources;
+  for (int nfix = 0; nfix < modify->nfix; nfix++) {
+    int dim = 0;
+    auto *source = static_cast<DihedralDegradation *>(
+        modify->fix[nfix]->extract("dihedral_degradation", dim));
+    if (source) degradation_sources.push_back(source);
+  }
+
   double **x = atom->x;
   double **f = atom->f;
+  int *atom_type = atom->type;
   int **dihedrallist = neighbor->dihedrallist;
   int ndihedrallist = neighbor->ndihedrallist;
   int nlocal = atom->nlocal;
@@ -81,6 +94,18 @@ void DihedralHarmonic::compute(int eflag, int vflag)
     i3 = dihedrallist[n][2];
     i4 = dihedrallist[n][3];
     type = dihedrallist[n][4];
+
+    // Layer membership comes from atom types, independently of dihedral type.
+    // Multiple fixes retain the smallest ratio without multiplying damage.
+
+    double scale = 1.0;
+    const int layer_type = atom_type[i1];
+    if ((atom_type[i2] == layer_type) && (atom_type[i3] == layer_type) &&
+        (atom_type[i4] == layer_type))
+      for (const auto *source : degradation_sources)
+        scale = std::min(scale, source->dihedral_scale(layer_type));
+    if (scale == 0.0) continue;
+    const double effective_k = scale * k[type];
 
     // 1st bond
 
@@ -154,7 +179,7 @@ void DihedralHarmonic::compute(int eflag, int vflag)
       df1 = 0.0;
     }
 
-    if (eflag) edihedral = k[type] * p;
+    if (eflag) edihedral = effective_k * p;
 
     fg = vb1x * vb2xm + vb1y * vb2ym + vb1z * vb2zm;
     hg = vb3x * vb2xm + vb3y * vb2ym + vb3z * vb2zm;
@@ -173,7 +198,7 @@ void DihedralHarmonic::compute(int eflag, int vflag)
     dthy = gbb * by;
     dthz = gbb * bz;
 
-    df = -k[type] * df1;
+    df = -effective_k * df1;
 
     sx2 = df * dtgx;
     sy2 = df * dtgy;

@@ -951,6 +951,8 @@
 /fix_bocs.h
 /fix_bond_break.cpp
 /fix_bond_break.h
+/fix_bond_break_c.cpp
+/fix_bond_break_c.h
 /fix_bond_create.cpp
 /fix_bond_create.h
 /fix_bond_create_angle.cpp
