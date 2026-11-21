@@ -63,7 +63,8 @@ class FixBondBreakC : public Fix, public DihedralDegradation {
   int angleflag, dihedralflag, improperflag;
   bigint lastcheck;
 
-  int breakcount, breakcounttotal;
+  int tensile_count, tensile_count_total;
+  int compression_count, compression_count_total;
   int nmax;
   tagint *partner, *finalpartner;
   double *score, *probability;

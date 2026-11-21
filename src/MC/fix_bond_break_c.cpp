@@ -34,11 +34,15 @@
    per-rank random states. Recreate the same fix ID/style/btype after restart.
    The current compile-time ratio is applied to restored damage. Ordinary
    write_data omits damage; unfix removes its weakening effect. Restart format
-   2 does not interpret V1.2 per-bond damage as layer damage. Random trajectories
+   3 stores separate tensile and compression counts; earlier formats do not
+   contain the required separate history. Random trajectories
    are only reproducible with unchanged rank count and atom ordering.
 
-   f_ID[1] and f_ID[2] count successful bond events, not damaged layers or
-   dihedrals. Multiple compression bonds in one check may mark the same layer.
+   f_ID[1:2] report recent/cumulative tensile deletions; f_ID[3:4] report
+   recent/cumulative compression triggers. f_ID[5] is the cumulative sum and
+   f_ID[6] is the current global bond count. Recent counts retain the last
+   check's values between checks. Multiple compression bonds in one check may
+   mark the same layer, so trigger counts are not layer or dihedral counts.
 
 ------------------------------------------------------------------------- */
 
@@ -68,7 +72,7 @@ using namespace FixConst;
 
 // Developer interface: retained dihedral strength in a damaged layer.
 // Change this constant and rebuild to compare degradation ratios.
-static constexpr double DEGRADATION_RATIO = 0.015;
+static constexpr double DEGRADATION_RATIO = 0.03;
 static_assert(DEGRADATION_RATIO >= 0.0 && DEGRADATION_RATIO <= 1.0,
               "DEGRADATION_RATIO must be between 0 and 1");
 
@@ -92,7 +96,7 @@ FixBondBreakC::FixBondBreakC(LAMMPS *lmp, int narg, char **arg) :
   force_reneighbor = 1;
   next_reneighbor = -1;
   vector_flag = 1;
-  size_vector = 2;
+  size_vector = 6;
   global_freq = 1;
   extvector = 0;
   restart_global = 1;
@@ -164,8 +168,8 @@ FixBondBreakC::FixBondBreakC(LAMMPS *lmp, int narg, char **arg) :
 
   // zero out stats
 
-  breakcount = 0;
-  breakcounttotal = 0;
+  tensile_count = tensile_count_total = 0;
+  compression_count = compression_count_total = 0;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -245,7 +249,7 @@ void FixBondBreakC::init()
 void FixBondBreakC::post_integrate()
 {
   int i,j,k,m,n,i1,i2,n1,n3,type;
-  int ndelete,deletecount;
+  int ndelete,deletecount,eventcount;
   double delx,dely,delz,rsq,candidate_score;
   tagint candidate_partner;
   tagint *slist;
@@ -476,15 +480,18 @@ void FixBondBreakC::post_integrate()
 
   // tally stats
 
-  MPI_Allreduce(&nbreak,&breakcount,1,MPI_INT,MPI_SUM,world);
+  MPI_Allreduce(&nbreak,&eventcount,1,MPI_INT,MPI_SUM,world);
   MPI_Allreduce(&ndelete,&deletecount,1,MPI_INT,MPI_SUM,world);
-  breakcounttotal += breakcount;
+  tensile_count = deletecount;
+  compression_count = eventcount-deletecount;
+  tensile_count_total += tensile_count;
+  compression_count_total += compression_count;
   atom->nbonds -= deletecount;
 
   // Replicate new records before atom migration and force evaluation. All
   // ranks then recognize damage regardless of which rank owns either atom.
 
-  if (breakcount > deletecount) synchronize_degraded_types(newly_degraded);
+  if (compression_count) synchronize_degraded_types(newly_degraded);
 
   // if visualization support is enabled, age vizatoms and remove expired ones
   if (vizsteps > 0) {
@@ -983,8 +990,12 @@ void FixBondBreakC::unpack_reverse_comm(int n, int *list, double *buf)
 
 double FixBondBreakC::compute_vector(int n)
 {
-  if (n == 0) return (double) breakcount;
-  return (double) breakcounttotal;
+  if (n == 0) return static_cast<double>(tensile_count);
+  if (n == 1) return static_cast<double>(tensile_count_total);
+  if (n == 2) return static_cast<double>(compression_count);
+  if (n == 3) return static_cast<double>(compression_count_total);
+  if (n == 4) return static_cast<double>(tensile_count_total)+compression_count_total;
+  return static_cast<double>(atom->nbonds);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1031,14 +1042,16 @@ void FixBondBreakC::write_restart(FILE *fp)
              RanMars::STATE_SIZE,MPI_DOUBLE,0,world);
   if (me != 0) return;
 
-  std::vector<double> values(6+degraded_types.size());
-  values[0] = 2.0;    // layer damage; incompatible with V1.2 bond damage
+  std::vector<double> values(8+degraded_types.size());
+  values[0] = 3.0;    // separate tensile and compression event histories
   values[1] = btype;
-  values[2] = breakcount;
-  values[3] = breakcounttotal;
-  values[4] = static_cast<double>(degraded_types.size());
-  values[5] = nprocs;
-  size_t n = 6;
+  values[2] = tensile_count;
+  values[3] = tensile_count_total;
+  values[4] = compression_count;
+  values[5] = compression_count_total;
+  values[6] = static_cast<double>(degraded_types.size());
+  values[7] = nprocs;
+  size_t n = 8;
   for (int type : degraded_types) values[n++] = type;
   values.insert(values.end(),states.begin(),states.end());
 
@@ -1052,20 +1065,22 @@ void FixBondBreakC::write_restart(FILE *fp)
 void FixBondBreakC::restart(char *buf)
 {
   auto *values = reinterpret_cast<double *>(buf);
-  if ((values[0] != 2.0) || (values[1] != btype))
-    error->all(FLERR,"Incompatible fix bond/break/c restart state or bond type");
-  breakcount = static_cast<int>(values[2]);
-  breakcounttotal = static_cast<int>(values[3]);
-  const int ntypes = static_cast<int>(values[4]);
-  const int saved_nprocs = static_cast<int>(values[5]);
+  if ((values[0] != 3.0) || (values[1] != btype))
+    error->all(FLERR,"Incompatible fix bond/break/c restart state or bond type (requires format 3)");
+  tensile_count = static_cast<int>(values[2]);
+  tensile_count_total = static_cast<int>(values[3]);
+  compression_count = static_cast<int>(values[4]);
+  compression_count_total = static_cast<int>(values[5]);
+  const int ntypes = static_cast<int>(values[6]);
+  const int saved_nprocs = static_cast<int>(values[7]);
   degraded_types.clear();
   for (int n = 0; n < ntypes; n++)
-    degraded_types.insert(static_cast<int>(values[6+n]));
+    degraded_types.insert(static_cast<int>(values[8+n]));
 
   // Existing ranks resume their own streams; extra ranks retain seeded streams.
   // A different rank count does not reproduce the original random trajectory.
   if (me < saved_nprocs) {
-    double *states = values+6+ntypes;
+    double *states = values+8+ntypes;
     const int state_size = RanMars::state_size(states);
     random->set_state(states+me*state_size);
   }
