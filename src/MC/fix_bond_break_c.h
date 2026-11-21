@@ -23,6 +23,7 @@ FixStyle(bond/break/c,FixBondBreakC);
 #include "fix.h"
 #include "dihedral_degradation.h"
 
+#include <array>
 #include <set>
 #include <unordered_map>
 #include <vector>
@@ -60,11 +61,13 @@ class FixBondBreakC : public Fix, public DihedralDegradation {
   double maxcutoff, maxcutsq, mincutoff, mincutsq, fraction;
   // Atom types identify whole layers, independent of local atom indices.
   std::set<int> degraded_types;
+  using BondKey = std::array<tagint, 3>;
+  std::set<BondKey> active_compression_bonds;
   int angleflag, dihedralflag, improperflag;
   bigint lastcheck;
 
   int tensile_count, tensile_count_total;
-  int compression_count, compression_count_total;
+  bigint compression_change;
   int nmax;
   tagint *partner, *finalpartner;
   double *score, *probability;
@@ -89,7 +92,9 @@ class FixBondBreakC : public Fix, public DihedralDegradation {
   std::unordered_map<tagint, int> vizatoms;
   int vizsteps;    // number of steps to highlight atoms in reactions
 
+  static BondKey bond_key(tagint, tagint, int);
   void synchronize_degraded_types(const std::set<int> &);
+  void synchronize_compression_bonds(const std::set<BondKey> &);
   void check_ghosts();
   void update_topology();
   void break_angles(int, tagint, tagint);

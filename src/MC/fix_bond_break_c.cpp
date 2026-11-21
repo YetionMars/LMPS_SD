@@ -21,28 +21,33 @@
    DEGRADATION_RATIO times the original K, including atoms outside the group.
    Bonds, original coefficients, topology, and special neighbors are retained
    after compression. Mixed-type bonds do not trigger compression damage.
-   Damaged layers skip later compression events but remain eligible for
-   tensile deletion. Equality to either threshold does not trigger an event.
+   Each bond enters compression state only after mutual selection and the
+   probability test. An active bond is not selected for compression again
+   until its length recovers to r >= Rmin. Other bonds in damaged layers
+   remain eligible. Recovery removes bond state, never layer damage.
+   Tensile deletion remains available. Equality to a threshold does not
+   trigger failure; equality to Rmin ends active compression state.
 
    The compile-time ratio is in [0,1]. Zero disables affected dihedral terms;
-   one records damage without changing their strength. Damage never compounds.
+   one records damage without changing their strength. Layer damage never compounds.
    The internal DihedralDegradation interface separates this MC fix from the
    harmonic force style. Only plain dihedral_style harmonic consumes it.
 
    Each rank stores the complete damaged atom-type set; sorting and migration
    do not change layer identity. Restart stores that set, event counters, and
-   per-rank random states. Recreate the same fix ID/style/btype after restart.
+   active bond keys, and per-rank random states. Recreate the same fix
+   ID/style/btype after restart.
    The current compile-time ratio is applied to restored damage. Ordinary
    write_data omits damage; unfix removes its weakening effect. Restart format
-   3 stores separate tensile and compression counts; earlier formats do not
-   contain the required separate history. Random trajectories
+   4 stores reversible bond states; earlier formats do not contain the
+   required active bond keys. Random trajectories
    are only reproducible with unchanged rank count and atom ordering.
 
-   f_ID[1:2] report recent/cumulative tensile deletions; f_ID[3:4] report
-   recent/cumulative compression triggers. f_ID[5] is the cumulative sum and
-   f_ID[6] is the current global bond count. Recent counts retain the last
-   check's values between checks. Multiple compression bonds in one check may
-   mark the same layer, so trigger counts are not layer or dihedral counts.
+   f_ID[1:2] report recent/cumulative tensile deletions. f_ID[3] is the signed
+   change in active compression bonds at the latest check; f_ID[4] is their
+   current number. f_ID[5] adds cumulative tensile deletions to active bonds
+   and can decrease. f_ID[6] is the current global bond count. States update
+   every Nevery steps. Bond state counts are not layer or dihedral counts.
 
 ------------------------------------------------------------------------- */
 
@@ -169,7 +174,7 @@ FixBondBreakC::FixBondBreakC(LAMMPS *lmp, int narg, char **arg) :
   // zero out stats
 
   tensile_count = tensile_count_total = 0;
-  compression_count = compression_count_total = 0;
+  compression_change = 0;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -297,9 +302,34 @@ void FixBondBreakC::post_integrate()
   tagint *tag = atom->tag;
   int *mask = atom->mask;
   int *atom_type = atom->type;
+  int **bond_type = atom->bond_type;
+  tagint **bond_atom = atom->bond_atom;
+  int *num_bond = atom->num_bond;
   int **bondlist = neighbor->bondlist;
   int nbondlist = neighbor->nbondlist;
-  auto breakfixes = modify->get_fix_by_style("^bond/break/c$");
+
+  // Retain only active bonds that still exist in the actual topology and
+  // remain compressed. This pass does not depend on candidate selection.
+  // Newton-off duplicates are removed when the global set is assembled.
+
+  std::set<BondKey> next_compression_bonds;
+  for (i = 0; i < nlocal; i++) {
+    if (!(mask[i] & groupbit)) continue;
+    for (m = 0; m < num_bond[i]; m++) {
+      if (bond_type[i][m] != btype) continue;
+      const auto key = bond_key(tag[i],bond_atom[i][m],btype);
+      if (!active_compression_bonds.count(key)) continue;
+      j = atom->map(bond_atom[i][m]);
+      if (!(mask[j] & groupbit)) continue;
+      if (atom_type[i] != atom_type[j]) continue;
+      delx = x[i][0] - x[j][0];
+      dely = x[i][1] - x[j][1];
+      delz = x[i][2] - x[j][2];
+      domain->minimum_image(FLERR,delx,dely,delz);
+      rsq = delx*delx + dely*dely + delz*delz;
+      if (rsq < mincutsq) next_compression_bonds.insert(key);
+    }
+  }
 
   for (n = 0; n < nbondlist; n++) {
     i1 = bondlist[n][0];
@@ -321,16 +351,10 @@ void FixBondBreakC::post_integrate()
     if (rsq > maxcutsq) {
       candidate_score = rsq / maxcutsq;
     } else if (rsq < mincutsq) {
-      // The atom type identifies the whole layer. Only compression is
-      // suppressed after damage; tensile deletion above remains available.
+      // A layer stays damaged, but each inactive bond can trigger again.
+      // Active bonds leave the candidate pool until their length recovers.
       if (atom_type[i1] != atom_type[i2]) continue;
-      bool degraded = false;
-      for (auto *ifix : breakfixes)
-        if (static_cast<FixBondBreakC *>(ifix)->degraded_types.count(atom_type[i1])) {
-          degraded = true;
-          break;
-        }
-      if (degraded) continue;
+      if (active_compression_bonds.count(bond_key(tag[i1],tag[i2],type))) continue;
       if (rsq == 0.0)
         candidate_score = std::numeric_limits<double>::max();
       else
@@ -381,9 +405,6 @@ void FixBondBreakC::post_integrate()
   // if both atoms list each other as winning bond partner
   // and probability constraint is satisfied
 
-  int **bond_type = atom->bond_type;
-  tagint **bond_atom = atom->bond_atom;
-  int *num_bond = atom->num_bond;
   int **nspecial = atom->nspecial;
   tagint **special = atom->special;
 
@@ -419,11 +440,13 @@ void FixBondBreakC::post_integrate()
 
     if (compression_failure) {
 
-      // Record the layer on the owner of the smaller atom ID. Keep the
-      // bond and all topology; harmonic dihedrals query the layer strength.
-      // Publish only after this batch so event counts do not depend on order.
+      // Record each new bond once. Layer damage is a separate permanent
+      // state, so recovery and repeated entries never restore or compound K.
 
-      if (tag[i] < tag[j]) newly_degraded.insert(atom_type[i]);
+      if (tag[i] < tag[j]) {
+        next_compression_bonds.insert(bond_key(tag[i],tag[j],btype));
+        newly_degraded.insert(atom_type[i]);
+      }
 
     } else {
 
@@ -483,15 +506,16 @@ void FixBondBreakC::post_integrate()
   MPI_Allreduce(&nbreak,&eventcount,1,MPI_INT,MPI_SUM,world);
   MPI_Allreduce(&ndelete,&deletecount,1,MPI_INT,MPI_SUM,world);
   tensile_count = deletecount;
-  compression_count = eventcount-deletecount;
   tensile_count_total += tensile_count;
-  compression_count_total += compression_count;
   atom->nbonds -= deletecount;
 
   // Replicate new records before atom migration and force evaluation. All
   // ranks then recognize damage regardless of which rank owns either atom.
 
-  if (compression_count) synchronize_degraded_types(newly_degraded);
+  // Newly accepted compression events must update layer damage even when
+  // an equal number of other bonds recovered and the net change is zero.
+  if (eventcount > deletecount) synchronize_degraded_types(newly_degraded);
+  synchronize_compression_bonds(next_compression_bonds);
 
   // if visualization support is enabled, age vizatoms and remove expired ones
   if (vizsteps > 0) {
@@ -992,10 +1016,18 @@ double FixBondBreakC::compute_vector(int n)
 {
   if (n == 0) return static_cast<double>(tensile_count);
   if (n == 1) return static_cast<double>(tensile_count_total);
-  if (n == 2) return static_cast<double>(compression_count);
-  if (n == 3) return static_cast<double>(compression_count_total);
-  if (n == 4) return static_cast<double>(tensile_count_total)+compression_count_total;
+  if (n == 2) return static_cast<double>(compression_change);
+  if (n == 3) return static_cast<double>(active_compression_bonds.size());
+  if (n == 4) return static_cast<double>(tensile_count_total)+
+                    static_cast<double>(active_compression_bonds.size());
   return static_cast<double>(atom->nbonds);
+}
+
+/* ---------------------------------------------------------------------- */
+
+FixBondBreakC::BondKey FixBondBreakC::bond_key(tagint id1, tagint id2, int type)
+{
+  return {std::min(id1,id2),std::max(id1,id2),type};
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1030,6 +1062,37 @@ void FixBondBreakC::synchronize_degraded_types(const std::set<int> &local)
 }
 
 /* ----------------------------------------------------------------------
+   replicate retained and newly accepted bond keys, independently of owners
+------------------------------------------------------------------------- */
+
+void FixBondBreakC::synchronize_compression_bonds(const std::set<BondKey> &local)
+{
+  const int nsend = static_cast<int>(3*local.size());
+  std::vector<tagint> send(MAX(1,nsend));
+  int n = 0;
+  for (const auto &key : local)
+    for (auto value : key) send[n++] = value;
+
+  std::vector<int> counts(nprocs), offsets(nprocs);
+  MPI_Allgather(&nsend,1,MPI_INT,counts.data(),1,MPI_INT,world);
+  int nrecv = 0;
+  for (int p = 0; p < nprocs; p++) {
+    offsets[p] = nrecv;
+    nrecv += counts[p];
+  }
+  std::vector<tagint> received(MAX(1,nrecv));
+  MPI_Allgatherv(send.data(),nsend,MPI_LMP_TAGINT,received.data(),counts.data(),
+                 offsets.data(),MPI_LMP_TAGINT,world);
+
+  std::set<BondKey> updated;
+  for (n = 0; n < nrecv; n += 3)
+    updated.insert({received[n],received[n+1],received[n+2]});
+  compression_change = static_cast<bigint>(updated.size())-
+                       static_cast<bigint>(active_compression_bonds.size());
+  active_compression_bonds.swap(updated);
+}
+
+/* ----------------------------------------------------------------------
    preserve layer state, counters, and each rank's probability stream
 ------------------------------------------------------------------------- */
 
@@ -1042,17 +1105,19 @@ void FixBondBreakC::write_restart(FILE *fp)
              RanMars::STATE_SIZE,MPI_DOUBLE,0,world);
   if (me != 0) return;
 
-  std::vector<double> values(8+degraded_types.size());
-  values[0] = 3.0;    // separate tensile and compression event histories
+  std::vector<double> values(8+degraded_types.size()+3*active_compression_bonds.size());
+  values[0] = 4.0;    // permanent layers and reversible per-bond states
   values[1] = btype;
   values[2] = tensile_count;
   values[3] = tensile_count_total;
-  values[4] = compression_count;
-  values[5] = compression_count_total;
-  values[6] = static_cast<double>(degraded_types.size());
+  values[4] = ubuf(compression_change).d;
+  values[5] = static_cast<double>(degraded_types.size());
+  values[6] = static_cast<double>(active_compression_bonds.size());
   values[7] = nprocs;
   size_t n = 8;
   for (int type : degraded_types) values[n++] = type;
+  for (const auto &key : active_compression_bonds)
+    for (auto value : key) values[n++] = ubuf(value).d;
   values.insert(values.end(),states.begin(),states.end());
 
   int size = static_cast<int>(values.size()*sizeof(double));
@@ -1065,22 +1130,29 @@ void FixBondBreakC::write_restart(FILE *fp)
 void FixBondBreakC::restart(char *buf)
 {
   auto *values = reinterpret_cast<double *>(buf);
-  if ((values[0] != 3.0) || (values[1] != btype))
-    error->all(FLERR,"Incompatible fix bond/break/c restart state or bond type (requires format 3)");
+  if ((values[0] != 4.0) || (values[1] != btype))
+    error->all(FLERR,"Incompatible fix bond/break/c restart state or bond type (requires format 4)");
   tensile_count = static_cast<int>(values[2]);
   tensile_count_total = static_cast<int>(values[3]);
-  compression_count = static_cast<int>(values[4]);
-  compression_count_total = static_cast<int>(values[5]);
-  const int ntypes = static_cast<int>(values[6]);
+  compression_change = static_cast<bigint>(ubuf(values[4]).i);
+  const int ntypes = static_cast<int>(values[5]);
+  const int nactive = static_cast<int>(values[6]);
   const int saved_nprocs = static_cast<int>(values[7]);
   degraded_types.clear();
-  for (int n = 0; n < ntypes; n++)
-    degraded_types.insert(static_cast<int>(values[8+n]));
+  size_t n = 8;
+  for (int i = 0; i < ntypes; i++)
+    degraded_types.insert(static_cast<int>(values[n++]));
+  active_compression_bonds.clear();
+  for (int i = 0; i < nactive; i++) {
+    BondKey key;
+    for (auto &value : key) value = static_cast<tagint>(ubuf(values[n++]).i);
+    active_compression_bonds.insert(key);
+  }
 
   // Existing ranks resume their own streams; extra ranks retain seeded streams.
   // A different rank count does not reproduce the original random trajectory.
   if (me < saved_nprocs) {
-    double *states = values+8+ntypes;
+    double *states = values+n;
     const int state_size = RanMars::state_size(states);
     random->set_state(states+me*state_size);
   }
@@ -1096,6 +1168,7 @@ double FixBondBreakC::memory_usage()
   double bytes = 2*nmax * sizeof(tagint);
   bytes += (double)nmax * sizeof(double);
   bytes += degraded_types.size() * (sizeof(int) + 4*sizeof(void *));
+  bytes += active_compression_bonds.size() * (sizeof(BondKey) + 4*sizeof(void *));
   return bytes;
 }
 
